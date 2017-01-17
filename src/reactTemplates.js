@@ -30,7 +30,7 @@ const propsMergeFunction = `function mergeProps(inline,external) {
 }
 `;
 
-const classSetTemplate = _.template('_(<%= classSet %>).transform(function(res, value, key){ if(value){ res.push(key); } }, []).join(" ")');
+const classSetTemplate = _.template('_.transform(<%= classSet %>, function(res, value, key){ if(value){ res.push(key); } }, []).join(" ")');
 
 function getTagTemplateString(simpleTagTemplate, shouldCreateElement) {
     if (simpleTagTemplate) {
@@ -91,10 +91,11 @@ function reactImport(options) {
     if (options.native) {
         return reactNativeSupport[options.nativeTargetVersion].react.module;
     }
-    if (_.includes(['0.14.0', '0.15.0', '15.0.0', '15.0.1'], options.targetVersion)) {
-        return 'react';
+    if (!options.reactImportPath) {
+        const isNewReact = _.includes(['0.14.0', '0.15.0', '15.0.0', '15.0.1'], options.targetVersion);
+        return isNewReact ? 'react' : 'react/addons';
     }
-    return 'react/addons';
+    return options.reactImportPath;
 }
 
 /**
@@ -199,23 +200,39 @@ function generateProps(node, context) {
     });
     _.assign(props, generateTemplateProps(node, context));
 
+    // map 'className' back into 'class' for custom elements
+    if (props[reactSupport.classNameProp] && isCustomElement(node.name)) {
+        props[classAttr] = props[reactSupport.classNameProp];
+        delete props[reactSupport.classNameProp];
+    }
+
     const propStr = _.map(props, (v, k) => `${JSON.stringify(k)} : ${v}`).join(',');
     return `{${propStr}}`;
 }
 
 function handleEventHandler(val, context, node, key) {
-    const funcParts = val.split('=>');
-    if (funcParts.length !== 2) {
-        throw RTCodeError.build(context, node, `when using 'on' events, use lambda '(p1,p2)=>body' notation or use {} to return a callback function. error: [${key}='${val}']`);
+    let handlerString;
+    if (_.startsWith(val, 'this.')) {
+        if (context.options.autobind) {
+            handlerString = `${val}.bind(this)`;
+        } else {
+            throw RTCodeError.build(context, node, "'this.handler' syntax allowed only when the --autobind is on, use {} to return a callback function.");
+        }
+    } else {
+        const funcParts = val.split('=>');
+        if (funcParts.length !== 2) {
+            throw RTCodeError.build(context, node, `when using 'on' events, use lambda '(p1,p2)=>body' notation or 'this.handler'; otherwise use {} to return a callback function. error: [${key}='${val}']`);
+        }
+        const evtParams = funcParts[0].replace('(', '').replace(')', '').trim();
+        const funcBody = funcParts[1].trim();
+        let params = context.boundParams;
+        if (evtParams.trim() !== '') {
+            params = params.concat([evtParams.trim()]);
+        }
+        const generatedFuncName = generateInjectedFunc(context, key, funcBody, params);
+        handlerString = genBind(generatedFuncName, context.boundParams);
     }
-    const evtParams = funcParts[0].replace('(', '').replace(')', '').trim();
-    const funcBody = funcParts[1].trim();
-    let params = context.boundParams;
-    if (evtParams.trim() !== '') {
-        params = params.concat([evtParams.trim()]);
-    }
-    const generatedFuncName = generateInjectedFunc(context, key, funcBody, params);
-    return genBind(generatedFuncName, context.boundParams);
+    return handlerString;
 }
 
 function genBind(func, args) {
@@ -231,7 +248,7 @@ function handleStyleProp(val, node, context) {
         .map(i => {
             const pair = i.split(':');
             const key = pair[0].trim();
-            if (/\{|\}/g.test(key)) {
+            if (/\{|}/g.test(key)) {
                 throw RTCodeError.build(context, node, 'style attribute keys cannot contain { } expressions');
             }
             const value = pair.slice(1).join(':').trim();
@@ -252,12 +269,16 @@ function convertTagNameToConstructor(tagName, context) {
         const targetSupport = reactNativeSupport[context.options.nativeTargetVersion];
         return _.includes(targetSupport.components, tagName) ? `${targetSupport.reactNative.name}.${tagName}` : tagName;
     }
-    let isHtmlTag = _.includes(reactDOMSupport[context.options.targetVersion], tagName);
+    let isHtmlTag = _.includes(reactDOMSupport[context.options.targetVersion], tagName) || isCustomElement(tagName);
     if (reactSupport.shouldUseCreateElement(context)) {
-        isHtmlTag = isHtmlTag || tagName.match(/^\w+(-\w+)$/);
+        isHtmlTag = isHtmlTag || tagName.match(/^\w+(-\w+)+$/);
         return isHtmlTag ? `'${tagName}'` : tagName;
     }
-    return isHtmlTag ? 'React.DOM.' + tagName : tagName;
+    return isHtmlTag ? `React.DOM.${tagName}` : tagName;
+}
+
+function isCustomElement(tagName) {
+    return tagName.match(/^\w+(-\w+)+$/);
 }
 
 /**
@@ -448,6 +469,44 @@ function convertHtmlToReact(node, context) {
     }
 }
 
+/**
+ * Parses the rt-scope attribute returning an array of parsed sections
+ *
+ * @param {String} scope The scope attribute to parse
+ * @returns {Array} an array of {expression,identifier}
+ * @throws {String} the part of the string that failed to parse
+ */
+function parseScopeSyntax(text) {
+    // the regex below was built using the following pseudo-code:
+    // double_quoted_string = `"[^"\\\\]*(?:\\\\.[^"\\\\]*)*"`
+    // single_quoted_string = `'[^'\\\\]*(?:\\\\.[^'\\\\]*)*'`
+    // text_out_of_quotes = `[^"']*?`
+    // expr_parts = double_quoted_string + "|" + single_quoted_string + "|" + text_out_of_quotes
+    // expression = zeroOrMore(nonCapture(expr_parts)) + "?"
+    // id = "[$_a-zA-Z]+[$_a-zA-Z0-9]*"
+    // as = " as" + OneOrMore(" ")
+    // optional_spaces = zeroOrMore(" ")
+    // semicolon = nonCapture(or(text(";"), "$"))
+    //
+    // regex = capture(expression) + as + capture(id) + optional_spaces + semicolon + optional_spaces
+
+    const regex = RegExp("((?:(?:\"[^\"\\\\]*(?:\\\\.[^\"\\\\]*)*\"|'[^'\\\\]*(?:\\\\.[^'\\\\]*)*'|[^\"']*?))*?) as(?: )+([$_a-zA-Z]+[$_a-zA-Z0-9]*)(?: )*(?:;|$)(?: )*", 'g');
+    const res = [];
+    do {
+        const idx = regex.lastIndex;
+        const match = regex.exec(text);
+        if (regex.lastIndex === idx || match === null) {
+            throw text.substr(idx);
+        }
+        if (match.index === regex.lastIndex) {
+            regex.lastIndex++;
+        }
+        res.push({expression: match[1].trim(), identifier: match[2]});
+    } while (regex.lastIndex < text.length);
+
+    return res;
+}
+
 function handleScopeAttribute(node, context, data) {
     data.innerScope = {
         scopeName: '',
@@ -457,25 +516,26 @@ function handleScopeAttribute(node, context, data) {
 
     data.innerScope.outerMapping = _.zipObject(context.boundParams, context.boundParams);
 
-    _(node.attribs[scopeAttr]).split(';').invokeMap('trim').compact().forEach(scopePart => {
-        const scopeSubParts = _(scopePart).split(' as ').invokeMap('trim').value();
-        if (scopeSubParts.length < 2) {
-            throw RTCodeError.build(context, node, `invalid scope part '${scopePart}'`);
-        }
-        const alias = scopeSubParts[1];
-        const value = scopeSubParts[0];
-        validateJS(alias, node, context);
+    let scopes;
+    try {
+        scopes = parseScopeSyntax(node.attribs[scopeAttr]);
+    } catch (scopePart) {
+        throw RTCodeError.build(context, node, `invalid scope part '${scopePart}'`);
+    }
+
+    scopes.forEach(({expression, identifier}) => {
+        validateJS(identifier, node, context);
 
         // this adds both parameters to the list of parameters passed further down
         // the scope chain, as well as variables that are locally bound before any
         // function call, as with the ones we generate for rt-scope.
-        if (!_.includes(context.boundParams, alias)) {
-            context.boundParams.push(alias);
+        if (!_.includes(context.boundParams, identifier)) {
+            context.boundParams.push(identifier);
         }
 
-        data.innerScope.scopeName += _.upperFirst(alias);
-        data.innerScope.innerMapping[alias] = `var ${alias} = ${value};`;
-        validateJS(data.innerScope.innerMapping[alias], node, context);
+        data.innerScope.scopeName += _.upperFirst(identifier);
+        data.innerScope.innerMapping[identifier] = `var ${identifier} = ${expression};`;
+        validateJS(data.innerScope.innerMapping[identifier], node, context);
     });
 }
 
